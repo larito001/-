@@ -175,7 +175,7 @@ DETECTION_INTERVAL = (2.0, 4.0)      # 检测间隔范围（秒）
 CLICK_OFFSET = 5                      # 点击随机偏移像素
 HERO_SELECT_WAIT = (1.5, 2.5)        # 选精灵后等待时间
 BUTTON_TPL_THRESHOLD = 0.7           # 按钮模板匹配阈值
-BATTLE_TPL_THRESHOLD = 0.6           # "战报" 模板匹配阈值
+BATTLE_TPL_THRESHOLD = 0.55          # "战报" 模板匹配阈值
 DEBUG_SAVE = True                    # 是否保存调试截图到 debug/ 文件夹
 MOUSE_MOVE_STEPS = 15                # 鼠标移动插值步数
 
@@ -382,16 +382,26 @@ _MapVirtualKeyW = _user32.MapVirtualKeyW
 KEYEVENTF_SCANCODE = 0x0008
 
 
+# VK 码 → interception-python 键名映射
+_VK_TO_KEYNAME = {
+    0x20: 'space',
+    0x30: '0', 0x31: '1', 0x32: '2', 0x33: '3', 0x34: '4',
+    0x35: '5', 0x36: '6', 0x37: '7', 0x38: '8', 0x39: '9',
+}
+
+
 def win32_key_press(vk_code):
     """模拟按下并松开一个键"""
-    scan = _MapVirtualKeyW(vk_code, 0)
-
     if _USE_INTERCEPTION:
-        _icp.key_down(scan)
-        time.sleep(random.uniform(0.04, 0.10))
-        _icp.key_up(scan)
-        return
+        key_name = _VK_TO_KEYNAME.get(vk_code)
+        if key_name:
+            _icp.key_down(key_name, delay=random.uniform(0.04, 0.10))
+            _icp.key_up(key_name)
+            return
+        # 未映射的键回退 SendInput
+        log.debug("VK 0x%02X 无 Interception 键名映射，回退 SendInput", vk_code)
 
+    scan = _MapVirtualKeyW(vk_code, 0)
     extra = ctypes.cast(
         _GetMessageExtraInfo(), ctypes.POINTER(ctypes.c_ulong))
 
@@ -480,8 +490,13 @@ def human_click(x, y, offset=CLICK_OFFSET):
 # ====================================================
 
 
+_dxcam_fail_count = 0          # 连续 dxcam 超时/失败计数
+_DXCAM_MAX_FAILS = 3           # 连续失败 N 次后自动禁用 dxcam
+
+
 def capture_region(x1, y1, x2, y2):
     """截取屏幕局部区域，返回 BGR numpy 数组（优先 DXGI，回退 GDI）"""
+    global _USE_DXCAM, _dxcam_fail_count
     w = x2 - x1
     h = y2 - y1
     if w <= 0 or h <= 0:
@@ -489,12 +504,37 @@ def capture_region(x1, y1, x2, y2):
 
     # ---- DXGI Desktop Duplication（不走 GDI，更难被拦截） ----
     if _USE_DXCAM and _dxcam_camera is not None:
-        for _ in range(3):
-            frame = _dxcam_camera.grab(region=(x1, y1, x2, y2))
-            if frame is not None:
-                return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            time.sleep(0.02)
-        # DXGI 连续失败，本次回退 GDI
+        result = [None]
+
+        def _grab():
+            try:
+                for _ in range(3):
+                    f = _dxcam_camera.grab(region=(x1, y1, x2, y2))
+                    if f is not None:
+                        result[0] = f
+                        return
+                    time.sleep(0.02)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_grab, daemon=True)
+        t.start()
+        t.join(timeout=2)               # 最多等 2 秒
+
+        if result[0] is not None:
+            _dxcam_fail_count = 0
+            return cv2.cvtColor(result[0], cv2.COLOR_RGB2BGR)
+
+        # dxcam 超时或返回空帧
+        _dxcam_fail_count += 1
+        if _dxcam_fail_count >= _DXCAM_MAX_FAILS:
+            log.warning("dxcam 连续 %d 次失败，自动禁用，后续使用 GDI",
+                        _dxcam_fail_count)
+            print("[后端] dxcam 连续失败，已切换到 GDI 截屏")
+            _USE_DXCAM = False
+        else:
+            log.debug("dxcam 第 %d 次失败/超时，本次回退 GDI",
+                      _dxcam_fail_count)
 
     # ---- GDI BitBlt 回退 ----
     hdc_screen = _user32.GetDC(0)
@@ -584,7 +624,7 @@ class PageDetector:
     """
     界面检测逻辑：
       1. 匹配 Button.jpg（左下区域）→ buttonPage
-      2. 未匹配 Button.jpg，但匹配战斗按钮栏（右下区域）→ selectHeroPage
+      2. 未匹配 Button.jpg，但右侧匹配战报图标 → selectHeroPage
       3. 都不匹配 → normal
     """
 
@@ -597,29 +637,23 @@ class PageDetector:
             raise FileNotFoundError(f"找不到模板: {btn_path}")
         self.button_gray = cv2.cvtColor(btn_img, cv2.COLOR_BGR2GRAY)
 
-        # ---- 从 selectPage.jpg 裁剪左侧 ⊙ 图标作为选英雄模板 ----
-        hero_page_path = os.path.join(RESOURCE_DIR, "selectPage.jpg")
-        hero_page_img = _imread_unicode(hero_page_path)
-        if hero_page_img is None:
-            log.error("找不到模板文件: %s", hero_page_path)
-            raise FileNotFoundError(f"找不到模板: {hero_page_path}")
-        hh, hw = hero_page_img.shape[:2]
-        # ⊙ 图标在左侧英雄列表，约 x=13-17%, y=27-32%
-        hero_crop = hero_page_img[int(hh * 0.27):int(hh * 0.32),
-                                  int(hw * 0.13):int(hw * 0.17)]
-        self.hero_icon_gray = cv2.cvtColor(hero_crop, cv2.COLOR_BGR2GRAY)
+        # ---- 加载 BattleReport.png（战报图标，selectHero 检测） ----
+        battle_path = os.path.join(RESOURCE_DIR, "BattleReport.png")
+        battle_img = _imread_unicode(battle_path)
+        if battle_img is None:
+            log.error("找不到模板文件: %s", battle_path)
+            raise FileNotFoundError(f"找不到模板: {battle_path}")
+        self.battle_tpl_gray = cv2.cvtColor(battle_img, cv2.COLOR_BGR2GRAY)
 
         print(f"[模板] Button:   {self.button_gray.shape}")
-        print(f"[模板] 英雄⊙:   {self.hero_icon_gray.shape}")
-        log.info("模板加载完成: Button=%s, 英雄⊙=%s",
-                 self.button_gray.shape, self.hero_icon_gray.shape)
+        print(f"[模板] 战报:     {self.battle_tpl_gray.shape}")
+        log.info("模板加载完成: Button=%s, 战报=%s",
+                 self.button_gray.shape, self.battle_tpl_gray.shape)
 
         self._debug_counter = 0
         if DEBUG_SAVE:
             self._debug_dir = os.path.join(RUNTIME_DIR, "debug")
             os.makedirs(self._debug_dir, exist_ok=True)
-            _imwrite_unicode(
-                os.path.join(self._debug_dir, "tpl_hero_icon.png"), hero_crop)
 
     def detect(self, region):
         x1, y1, x2, y2 = region
@@ -646,21 +680,21 @@ class PageDetector:
                      sx, sy, conf, scale)
             return "button_page", {"click": (sx, sy), "conf": conf}
 
-        # ---- 2. 左侧有 ⊙ 图标且左下无星星 → selectHeroPage ----
-        left_area = gray[int(h * 0.15):int(h * 0.85), :int(w * 0.30)]
-        match_hero = multi_scale_match(left_area, self.hero_icon_gray,
-                                       threshold=BATTLE_TPL_THRESHOLD)
-        if match_hero:
-            _, _, conf2 = match_hero
-            print(f"[selectHero] ⊙图标匹配 置信度={conf2:.2f}")
-            log.info("检测到 selectHero: ⊙图标匹配置信度=%.2f", conf2)
+        # ---- 2. 右侧有战报图标且左下无星星 → selectHeroPage ----
+        right_area = gray[int(h * 0.6):, int(w * 0.7):]
+        match_battle = multi_scale_match(right_area, self.battle_tpl_gray,
+                                         threshold=BATTLE_TPL_THRESHOLD)
+        if match_battle:
+            _, _, conf2 = match_battle
+            print(f"[selectHero] 战报匹配 置信度={conf2:.2f}")
+            log.info("检测到 selectHero: 战报匹配置信度=%.2f", conf2)
             return "select_hero", {}
 
         # ---- 3. 其余情况 → 不做任何操作 ----
-        # 诊断：输出 ⊙ 最佳匹配值（即使低于阈值）
-        diag = multi_scale_match(left_area, self.hero_icon_gray, threshold=0.0)
+        # 诊断：输出战报最佳匹配值（即使低于阈值）
+        diag = multi_scale_match(right_area, self.battle_tpl_gray, threshold=0.0)
         best_conf = diag[2] if diag else 0
-        log.debug("检测结果: normal（无匹配）| ⊙最佳置信度=%.3f 阈值=%.2f",
+        log.debug("检测结果: normal（无匹配）| 战报最佳置信度=%.3f 阈值=%.2f",
                   best_conf, BATTLE_TPL_THRESHOLD)
 
         # 每 10 次保存一帧供诊断
@@ -670,8 +704,8 @@ class PageDetector:
                 _imwrite_unicode(
                     os.path.join(self._debug_dir, "screen_latest.png"), screen)
                 _imwrite_unicode(
-                    os.path.join(self._debug_dir, "left_area_latest.png"),
-                    left_area)
+                    os.path.join(self._debug_dir, "right_area_latest.png"),
+                    right_area)
 
         return "normal", None
 
@@ -727,13 +761,24 @@ class AutoBattle:
                 self._interruptible_sleep(afk)
                 continue
 
-            try:
-                page, info = self.detector.detect(self.region)
-            except Exception as e:
-                print(f"[检测异常] {e}")
-                log.exception("界面检测异常: %s", e)
-                time.sleep(2)
+            # 带超时检测（防止 dxcam 截屏阻塞）
+            detect_result = [None]
+
+            def _detect_main():
+                try:
+                    detect_result[0] = self.detector.detect(self.region)
+                except Exception as e:
+                    log.exception("界面检测异常: %s", e)
+
+            dt = threading.Thread(target=_detect_main, daemon=True)
+            dt.start()
+            dt.join(timeout=8)
+
+            if detect_result[0] is None:
+                log.warning("主循环 detect() 超时或异常，跳过本次")
                 continue
+
+            page, info = detect_result[0]
 
             # 偶尔检测到了但"犹豫"不操作（~3%）
             if page != "normal" and random.random() < 0.03:
@@ -781,22 +826,44 @@ class AutoBattle:
             win32_key_press(vk_num)
             time.sleep(random.uniform(0.15, 0.35))
             win32_key_press(VK_SPACE)
+            log.debug("选精灵: 按键 %d 已发送，等待界面响应", num)
 
             # 等待界面响应
             self._interruptible_sleep(random.uniform(*HERO_SELECT_WAIT))
+            if not self.running:
+                return
 
-            # 检查是否已离开选英雄页面
-            try:
-                page2, _ = self.detector.detect(self.region)
-                if page2 != "select_hero":
-                    print(f"[selectHero] → 已离开选英雄界面")
-                    log.info("选精灵完成: 按键 %d 后离开选英雄界面", num)
-                    return
-            except Exception:
-                pass
+            # 带超时检测是否已离开选英雄页面
+            page2 = self._detect_with_timeout()
+            log.debug("选精灵: 按键 %d 后检测结果=%s", num, page2)
+
+            if page2 is not None and page2 != "select_hero":
+                print(f"[selectHero] → 已离开选英雄界面 ({page2})")
+                log.info("选精灵完成: 按键 %d 后离开选英雄界面 (%s)", num, page2)
+                return
+            elif page2 is None:
+                log.warning("选精灵: 按键 %d 后检测超时，继续尝试下一个", num)
 
         print("[selectHero] 1-6 全部尝试完毕")
         log.info("选精灵: 1-6 全部尝试完毕")
+
+    def _detect_with_timeout(self, timeout=5):
+        """带超时的 detect()，防止截屏阻塞卡死整个循环。超时返回 None。"""
+        result = [None]
+
+        def _run():
+            try:
+                result[0] = self.detector.detect(self.region)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+
+        if result[0] is not None:
+            return result[0][0]     # 返回 page 名称
+        return None
 
     def _do_idle(self):
         if random.random() < 0.15:
