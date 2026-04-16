@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python *)",
+      "Bash(mkdir -p src)",
+      "Bash(mv auto_battle.py auto_clicker.py Button.jpg SelectHero.jpg buttonPage.jpg selectPage.jpg auto_battle.bat auto_clicker.bat src/)",
+      "Bash(python3 *)",
+      "Bash(ls *)"
+    ]
+  }
+}
