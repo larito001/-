@@ -148,7 +148,7 @@ DETECTION_INTERVAL = (0.8, 1.8)      # 检测间隔范围（秒）
 CLICK_OFFSET = 5                      # 点击随机偏移像素
 HERO_SELECT_WAIT = (1.5, 2.5)        # 选精灵后等待时间
 BUTTON_TPL_THRESHOLD = 0.7           # 按钮模板匹配阈值
-BATTLE_TPL_THRESHOLD = 0.62          # 战报/逃跑 模板匹配阈值
+BATTLE_TPL_THRESHOLD = 0.62          # 战报/更换 模板匹配阈值
 CONFIRM_COUNT = 2                    # 连续检测到 N 次同一状态才确认
 DEBUG_SAVE = False                   # 调试模式，开启后保存截图到 debug/
 MOUSE_MOVE_STEPS = 15                # 鼠标移动插值步数
@@ -702,7 +702,7 @@ class PageDetector:
             raise FileNotFoundError(f"找不到模板: {battle_path}")
         self.battle_tpl_gray = cv2.cvtColor(battle_img, cv2.COLOR_BGR2GRAY)
 
-        # ---- SelectRun.jpg（逃跑按钮，右下角第一个） ----
+        # ---- SelectRun.jpg（更换按钮，右下角） ----
         run_path = os.path.join(RESOURCE_DIR, "SelectRun.jpg")
         run_img = _imread_unicode(run_path)
         if run_img is None:
@@ -745,15 +745,22 @@ class PageDetector:
             log.info("btn (%d,%d) c=%.2f s=%.2f", sx, sy, conf, scale)
             return "button_page", {"click": (sx, sy), "conf": conf}
 
-        # ---- 2. Button 不存在，用边缘匹配检测战报 + SelectRun ----
-        #    边缘匹配不受背景颜色/高亮影响
+        # ---- 2. Button 不存在，检测战报 + 更换按钮 ----
+        #    双重匹配：边缘（不受颜色/亮度影响）+ 灰度（对带文字按钮更稳）
         right_area = gray[int(h * 0.6):, int(w * 0.7):]
-        match_battle = multi_scale_match_edge(right_area, self.battle_tpl_gray,
-                                              threshold=0.35)
+        # 战报：边缘或灰度任一命中
+        mb_edge = multi_scale_match_edge(right_area, self.battle_tpl_gray,
+                                         threshold=0.35)
+        mb_gray = multi_scale_match(right_area, self.battle_tpl_gray,
+                                    threshold=0.55)
+        match_battle = mb_edge or mb_gray
 
         bottom_right = gray[int(h * 0.7):, int(w * 0.5):]
-        match_run = multi_scale_match_edge(bottom_right, self.select_run_gray,
-                                           threshold=0.35)
+        mr_edge = multi_scale_match_edge(bottom_right, self.select_run_gray,
+                                         threshold=0.35)
+        mr_gray = multi_scale_match(bottom_right, self.select_run_gray,
+                                    threshold=0.55)
+        match_run = mr_edge or mr_gray
 
         if match_battle and match_run:
             conf_b = match_battle[2]
@@ -761,6 +768,21 @@ class PageDetector:
             print(f"[selectHero] battle={conf_b:.2f} run={conf_r:.2f}")
             log.info("select_hero: battle=%.2f run=%.2f", conf_b, conf_r)
             return "select_hero", {}
+
+        # ---- 诊断：记录最佳置信度，辅助调参 ----
+        diag_b_edge = multi_scale_match_edge(right_area, self.battle_tpl_gray,
+                                             threshold=0.0)
+        diag_b_gray = multi_scale_match(right_area, self.battle_tpl_gray,
+                                        threshold=0.0)
+        diag_r_edge = multi_scale_match_edge(bottom_right, self.select_run_gray,
+                                             threshold=0.0)
+        diag_r_gray = multi_scale_match(bottom_right, self.select_run_gray,
+                                        threshold=0.0)
+        log.info("diag battle edge=%.2f gray=%.2f | run edge=%.2f gray=%.2f",
+                 diag_b_edge[2] if diag_b_edge else 0,
+                 diag_b_gray[2] if diag_b_gray else 0,
+                 diag_r_edge[2] if diag_r_edge else 0,
+                 diag_r_gray[2] if diag_r_gray else 0)
 
         # ---- 3. 其余 → normal ----
         if DEBUG_SAVE:
